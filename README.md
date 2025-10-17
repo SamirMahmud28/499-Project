@@ -8,7 +8,7 @@ Build a domain-optimized LLM with purposeful, problem-solving dialogue that stay
 - Automatic Prompt Optimization(APO)
 - Pruning, quantization
 - Domain-specific fine-tuning
-
+---
 
 ## 🚀 Features
 - List of core features
@@ -27,7 +27,7 @@ Build a domain-optimized LLM with purposeful, problem-solving dialogue that stay
 | Mohaimen Al Mamun      |  2221726642    |       |
 | Syed Tashriful Alam    | 2212623042     |       |
 
-
+---
 </div>
 ## 📦 Installation
 
