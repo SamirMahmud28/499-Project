@@ -1,8 +1,14 @@
-# Project Name
+# TalkWise — Purposeful Dialogue with an Optimized Domain-Specific LLM
 
-A short description of your project goes here. Explain briefly what it does and why it’s useful.
+This project aims to develop a domain-optimized large language model (LLM) capable of engaging in purposeful, goal-driven dialogues. Unlike general-purpose models (e.g., ChatGPT), our approach focuses on structured, problem-solving interactions while maintaining efficiency for real-world and edge deployments.
 
 ---
+## 🎯 Objective
+Build a domain-optimized LLM with purposeful, problem-solving dialogue that stays efficient through:
+- Automatic Prompt Optimization(APO)
+- Pruning, quantization
+- Domain-specific fine-tuning
+
 
 ## 🚀 Features
 - List of core features
