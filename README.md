@@ -1,6 +1,6 @@
 # ResearchGPT: A Multi-Agent Chat System for Research Paper Writing
 
-This project aims to develop a domain-optimized large language model (LLM) capable of engaging in purposeful, goal-driven dialogues. Unlike general-purpose models (e.g., ChatGPT), our approach focuses on structured, problem-solving interactions while maintaining efficiency for real-world and edge deployments.
+Build ResearchGPT, a domain-optimized multi-agent LLM system that helps students and early-career researchers plan, research, draft, and refine full research papers with a purposeful, problem-solving dialogue.The system is human-in-the-loop, meaning users can approve, edit, or re-run outputs at each phase, and can export a finalized paper in structured LaTeX.
 
 ---
 ## 🎯 Objective
