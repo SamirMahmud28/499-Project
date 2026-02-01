@@ -1,19 +1,22 @@
-# TalkWise — Purposeful Dialogue with an Optimized Domain-Specific LLM
+# ResearchGPT: A Multi-Agent Chat System for Research Paper Writing
 
 This project aims to develop a domain-optimized large language model (LLM) capable of engaging in purposeful, goal-driven dialogues. Unlike general-purpose models (e.g., ChatGPT), our approach focuses on structured, problem-solving interactions while maintaining efficiency for real-world and edge deployments.
 
 ---
 ## 🎯 Objective
-Build a domain-optimized LLM with purposeful, problem-solving dialogue that stays efficient through:
-- Automatic Prompt Optimization(APO)
-- Pruning, quantization
-- Domain-specific fine-tuning
+Build a domain-optimized, multi-agent LLM system that produces purposeful, problem-solving dialogue and reliably generates high-quality academic/technical documents (research papers, reports, proposals, and slide outlines).
+- Automatic Prompt Optimization (APO) to continuously improve task-specific prompts
+- Pruning / quantization + model routing to reduce latency and cost
+- Domain-specific fine-tuning (e.g., LoRA/QLoRA) for academic writing style and consistency
+- Quality-control loops (critic + checkpoints) to improve coherence and reduce unsupported claims
 ---
 
 ## 🚀 Features
 - List of core features
-- Key functionality
-- Any highlights that make your project stand out
+- Core capabilities
+- End-to-end paper writing pipeline: topic → outline → drafting → web research → citations → visuals → style polish → LaTeX assembly
+- Efficiency & optimization highlights
+- Integrations & tooling
 
 ---
 <div>
