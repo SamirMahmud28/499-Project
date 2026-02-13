@@ -117,11 +117,14 @@ async def update_run(
     run_id: str,
     token: str,
     *,
+    phase: str | None = None,
     step: str | None = None,
     status: str | None = None,
 ) -> None:
-    """Update a run's step and/or status in Supabase."""
+    """Update a run's phase, step, and/or status in Supabase."""
     patch = {}
+    if phase is not None:
+        patch["phase"] = phase
     if step is not None:
         patch["step"] = step
     if status is not None:

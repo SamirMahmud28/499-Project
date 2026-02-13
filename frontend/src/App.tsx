@@ -6,6 +6,7 @@ import VerifyEmail from './pages/VerifyEmail'
 import Callback from './pages/Callback'
 import Projects from './pages/Projects'
 import ProjectDetail from './pages/ProjectDetail'
+import RunDetail from './pages/RunDetail'
 import { ProtectedRoute } from './components/ProtectedRoute'
 
 function App() {
@@ -33,6 +34,14 @@ function App() {
           element={
             <ProtectedRoute>
               <ProjectDetail />
+            </ProtectedRoute>
+          }
+        />
+        <Route
+          path="/projects/:projectId/runs/:runId"
+          element={
+            <ProtectedRoute>
+              <RunDetail />
             </ProtectedRoute>
           }
         />
