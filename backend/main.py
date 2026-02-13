@@ -222,6 +222,41 @@ async def get_run(run_id: str, request: Request):
     return rows[0]
 
 
+@app.delete("/runs/{run_id}")
+async def delete_run(run_id: str, request: Request):
+    """Delete a run by ID (RLS enforced — cascades to artifacts + agent_logs)."""
+    token = _get_token(request)
+    if not token:
+        return JSONResponse(status_code=401, content={"detail": "Missing or invalid token"})
+
+    # Verify run exists + ownership (RLS)
+    async with httpx.AsyncClient() as client:
+        check = await client.get(
+            f"{SUPABASE_URL}/rest/v1/runs",
+            params={"select": "id", "id": f"eq.{run_id}"},
+            headers=_supabase_headers(token),
+        )
+
+    if check.status_code != 200 or not check.json():
+        return JSONResponse(status_code=404, content={"detail": "Run not found"})
+
+    # Delete via PostgREST (CASCADE handles artifacts + agent_logs)
+    async with httpx.AsyncClient() as client:
+        resp = await client.delete(
+            f"{SUPABASE_URL}/rest/v1/runs",
+            params={"id": f"eq.{run_id}"},
+            headers=_supabase_headers(token),
+        )
+
+    if resp.status_code not in (200, 204):
+        return JSONResponse(status_code=resp.status_code, content=resp.json())
+
+    # Clean up SSE queues for this run
+    _run_queues.pop(run_id, None)
+
+    return JSONResponse(status_code=200, content={"detail": "Run deleted"})
+
+
 # ── Artifacts ─────────────────────────────────────────────────
 
 @app.post("/runs/{run_id}/artifacts")
@@ -784,6 +819,384 @@ async def run_outline_endpoint(run_id: str, request: Request):
     ))
 
     return {"status": "running", "run_id": run_id, "step": "outline"}
+
+
+# ── Phase 2: Continue (transition from Phase 1) ──────────────
+
+@app.post("/runs/{run_id}/phase2/continue")
+async def phase2_continue(run_id: str, request: Request):
+    """Transition a completed Phase 1 run to Phase 2."""
+    from log_helpers import update_run as _update_run
+
+    token = _get_token(request)
+    if not token:
+        return JSONResponse(status_code=401, content={"detail": "Missing or invalid token"})
+
+    # Fetch run
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(
+            f"{SUPABASE_URL}/rest/v1/runs",
+            params={"select": "id,phase,step,status", "id": f"eq.{run_id}"},
+            headers=_supabase_headers(token),
+        )
+    if resp.status_code != 200 or not resp.json():
+        return JSONResponse(status_code=404, content={"detail": "Run not found"})
+
+    run_data = resp.json()[0]
+
+    # Must be Phase 1 completed with outline step
+    if run_data.get("step") != "outline" or run_data.get("status") != "completed":
+        return JSONResponse(status_code=400, content={"detail": "Phase 1 must be completed first"})
+
+    # Verify required artifacts exist
+    accepted = await _get_latest_artifact(run_id, token, "accepted_topic")
+    outline = await _get_latest_artifact(run_id, token, "outline")
+    if not accepted or not outline:
+        return JSONResponse(status_code=400, content={
+            "detail": "Required Phase 1 artifacts (accepted_topic, outline) not found"
+        })
+
+    # Transition to Phase 2
+    await _update_run(run_id, token, phase="phase2", step="phase2_constraints", status="awaiting_feedback")
+
+    return {"status": "ok", "phase": "phase2", "step": "phase2_constraints"}
+
+
+# ── Phase 2: Constraints ─────────────────────────────────────
+
+@app.post("/runs/{run_id}/phase2/constraints")
+async def phase2_constraints(run_id: str, request: Request):
+    """Submit Phase 2 constraints and advance to approach step."""
+    from log_helpers import create_artifact as _create_artifact, update_run as _update_run
+
+    token = _get_token(request)
+    if not token:
+        return JSONResponse(status_code=401, content={"detail": "Missing or invalid token"})
+
+    # Fetch run
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(
+            f"{SUPABASE_URL}/rest/v1/runs",
+            params={"select": "id,phase,step,status", "id": f"eq.{run_id}"},
+            headers=_supabase_headers(token),
+        )
+    if resp.status_code != 200 or not resp.json():
+        return JSONResponse(status_code=404, content={"detail": "Run not found"})
+
+    run_data = resp.json()[0]
+    if run_data.get("phase") != "phase2" or run_data.get("step") != "phase2_constraints":
+        return JSONResponse(status_code=400, content={"detail": "Run is not at the Phase 2 constraints step"})
+
+    # Parse body
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"detail": "Invalid request body"})
+
+    # Validate required fields
+    time_budget = body.get("time_budget", "").strip()
+    data_availability = body.get("data_availability", "").strip()
+    user_level = body.get("user_level", "").strip()
+    resources = body.get("resources", {})
+
+    if not time_budget or not data_availability or not user_level:
+        return JSONResponse(status_code=400, content={
+            "detail": "time_budget, data_availability, and user_level are required"
+        })
+
+    constraints_content = {
+        "metadata": {
+            "created_at": datetime.utcnow().isoformat() + "Z",
+            "user_level": user_level,
+        },
+        "time_budget": time_budget,
+        "data_availability": data_availability,
+        "resources": {
+            "lab_access": bool(resources.get("lab_access", False)),
+            "participants_access": bool(resources.get("participants_access", False)),
+            "software_tools": resources.get("software_tools", []),
+        },
+        "notes": body.get("notes", "").strip(),
+    }
+
+    # Create artifact
+    await _create_artifact(run_id, token, "phase2_constraints", constraints_content)
+
+    # Advance to approach step
+    await _update_run(run_id, token, step="phase2_approach", status="awaiting_feedback")
+
+    return {"status": "ok", "step": "phase2_approach"}
+
+
+# ── Phase 2: Approach Recommender ─────────────────────────────
+
+@app.post("/runs/{run_id}/phase2/approach")
+async def phase2_approach(run_id: str, request: Request):
+    """Start the ApproachRecommender LangGraph pipeline."""
+    token = _get_token(request)
+    if not token:
+        return JSONResponse(status_code=401, content={"detail": "Missing or invalid token"})
+
+    # Fetch run
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(
+            f"{SUPABASE_URL}/rest/v1/runs",
+            params={"select": "id,phase,step,status", "id": f"eq.{run_id}"},
+            headers=_supabase_headers(token),
+        )
+    if resp.status_code != 200 or not resp.json():
+        return JSONResponse(status_code=404, content={"detail": "Run not found"})
+
+    run_data = resp.json()[0]
+    if run_data.get("phase") != "phase2":
+        return JSONResponse(status_code=400, content={"detail": "Run is not in Phase 2"})
+    if run_data.get("status") == "running":
+        return JSONResponse(status_code=409, content={"detail": "A pipeline is already running for this run"})
+
+    # Load required artifacts
+    accepted = await _get_latest_artifact(run_id, token, "accepted_topic")
+    outline = await _get_latest_artifact(run_id, token, "outline")
+    constraints = await _get_latest_artifact(run_id, token, "phase2_constraints")
+
+    if not accepted:
+        return JSONResponse(status_code=400, content={"detail": "No accepted_topic artifact found"})
+    if not outline:
+        return JSONResponse(status_code=400, content={"detail": "No outline artifact found"})
+    if not constraints:
+        return JSONResponse(status_code=400, content={"detail": "No phase2_constraints artifact found"})
+
+    # Parse optional feedback
+    feedback = None
+    try:
+        body = await request.json()
+        feedback = body.get("feedback")
+    except Exception:
+        pass
+
+    from agents.phase2_approach import run_approach_recommender
+
+    asyncio.create_task(run_approach_recommender(
+        run_id=run_id,
+        token=token,
+        accepted_topic=accepted["content"],
+        outline=outline["content"],
+        constraints=constraints["content"],
+        feedback=feedback,
+    ))
+
+    return {"status": "running", "step": "phase2_approach"}
+
+
+# ── Phase 2: Select Approach ─────────────────────────────────
+
+VALID_APPROACHES = {
+    "Survey / Questionnaire",
+    "Controlled Experiment",
+    "Interview / Qualitative Study",
+    "Public Dataset Analysis",
+    "Systematic Literature Review",
+    "Comparative Evaluation",
+}
+
+
+@app.post("/runs/{run_id}/phase2/select_approach")
+async def phase2_select_approach(run_id: str, request: Request):
+    """Accept the user's selected approach and title, advance to sources step."""
+    from log_helpers import emit_log, create_artifact as _create_artifact, update_run as _update_run
+
+    token = _get_token(request)
+    if not token:
+        return JSONResponse(status_code=401, content={"detail": "Missing or invalid token"})
+
+    # Fetch run
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(
+            f"{SUPABASE_URL}/rest/v1/runs",
+            params={"select": "id,phase,step,status", "id": f"eq.{run_id}"},
+            headers=_supabase_headers(token),
+        )
+    if resp.status_code != 200 or not resp.json():
+        return JSONResponse(status_code=404, content={"detail": "Run not found"})
+
+    run_data = resp.json()[0]
+    if run_data.get("phase") != "phase2":
+        return JSONResponse(status_code=400, content={"detail": "Run is not in Phase 2"})
+
+    # Parse body
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"detail": "Request body is required"})
+
+    selected_approach = body.get("selected_approach", "").strip()
+    selected_title = body.get("selected_title", "").strip()
+
+    if not selected_approach or not selected_title:
+        return JSONResponse(status_code=400, content={
+            "detail": "selected_approach and selected_title are required"
+        })
+
+    if selected_approach not in VALID_APPROACHES:
+        return JSONResponse(status_code=400, content={
+            "detail": f"Invalid approach. Must be one of: {', '.join(sorted(VALID_APPROACHES))}"
+        })
+
+    # Load recommendation artifact (must exist)
+    rec_artifact = await _get_latest_artifact(run_id, token, "phase2_approach_recommendation")
+    if not rec_artifact:
+        return JSONResponse(status_code=400, content={
+            "detail": "No approach recommendation found. Run the recommender first."
+        })
+
+    notes = body.get("notes", "").strip()
+
+    selected_content = {
+        "metadata": {"selected_at": datetime.utcnow().isoformat() + "Z"},
+        "selected_approach": selected_approach,
+        "selected_title": selected_title,
+        "user_overrides": {"notes": notes},
+        "source_recommendation_version": rec_artifact.get("version", 1),
+    }
+
+    await _create_artifact(run_id, token, "phase2_selected_approach", selected_content)
+
+    await emit_log(run_id, token, "Orchestrator", "output", {
+        "message": f"Approach selected: {selected_approach}. Title: \"{selected_title}\"",
+    })
+
+    await _update_run(run_id, token, step="phase2_sources", status="awaiting_feedback")
+
+    return {"status": "accepted", "approach": selected_approach, "title": selected_title}
+
+
+# ── Phase 2: Sources & Evidence ───────────────────────────────
+
+@app.post("/runs/{run_id}/phase2/sources")
+async def phase2_sources(run_id: str, request: Request):
+    """Start the SourceScout + EvidencePlanner LangGraph pipeline."""
+    token = _get_token(request)
+    if not token:
+        return JSONResponse(status_code=401, content={"detail": "Missing or invalid token"})
+
+    # Fetch run
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(
+            f"{SUPABASE_URL}/rest/v1/runs",
+            params={"select": "id,phase,step,status", "id": f"eq.{run_id}"},
+            headers=_supabase_headers(token),
+        )
+    if resp.status_code != 200 or not resp.json():
+        return JSONResponse(status_code=404, content={"detail": "Run not found"})
+
+    run_data = resp.json()[0]
+    if run_data.get("phase") != "phase2":
+        return JSONResponse(status_code=400, content={"detail": "Run is not in Phase 2"})
+    if run_data.get("status") == "running":
+        return JSONResponse(status_code=409, content={"detail": "A pipeline is already running for this run"})
+
+    # Load 4 required artifacts
+    accepted = await _get_latest_artifact(run_id, token, "accepted_topic")
+    outline = await _get_latest_artifact(run_id, token, "outline")
+    constraints = await _get_latest_artifact(run_id, token, "phase2_constraints")
+    selected = await _get_latest_artifact(run_id, token, "phase2_selected_approach")
+
+    if not accepted:
+        return JSONResponse(status_code=400, content={"detail": "No accepted_topic artifact found"})
+    if not outline:
+        return JSONResponse(status_code=400, content={"detail": "No outline artifact found"})
+    if not constraints:
+        return JSONResponse(status_code=400, content={"detail": "No phase2_constraints artifact found"})
+    if not selected:
+        return JSONResponse(status_code=400, content={"detail": "No phase2_selected_approach artifact found"})
+
+    # Parse optional feedback
+    feedback = None
+    try:
+        body = await request.json()
+        feedback = body.get("feedback")
+    except Exception:
+        pass
+
+    from agents.phase2_sources import run_sources_and_evidence
+
+    asyncio.create_task(run_sources_and_evidence(
+        run_id=run_id,
+        token=token,
+        accepted_topic=accepted["content"],
+        outline=outline["content"],
+        constraints=constraints["content"],
+        selected_approach=selected["content"],
+        feedback=feedback,
+    ))
+
+    return {"status": "running", "step": "phase2_sources"}
+
+
+# ── Phase 2 Step 4: Research Plan Pack ─────────────────────────
+
+@app.post("/runs/{run_id}/phase2/plan")
+async def phase2_plan(run_id: str, request: Request):
+    """Start the MethodologyWriter LangGraph pipeline to generate the Research Plan Pack."""
+    token = _get_token(request)
+    if not token:
+        return JSONResponse(status_code=401, content={"detail": "Missing or invalid token"})
+
+    # Fetch run
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(
+            f"{SUPABASE_URL}/rest/v1/runs",
+            params={"select": "id,phase,step,status", "id": f"eq.{run_id}"},
+            headers=_supabase_headers(token),
+        )
+    if resp.status_code != 200 or not resp.json():
+        return JSONResponse(status_code=404, content={"detail": "Run not found"})
+
+    run_data = resp.json()[0]
+    if run_data.get("phase") != "phase2":
+        return JSONResponse(status_code=400, content={"detail": "Run is not in Phase 2"})
+    if run_data.get("status") == "running":
+        return JSONResponse(status_code=409, content={"detail": "A pipeline is already running for this run"})
+
+    # Load 6 artifacts
+    accepted = await _get_latest_artifact(run_id, token, "accepted_topic")
+    outline = await _get_latest_artifact(run_id, token, "outline")
+    constraints = await _get_latest_artifact(run_id, token, "phase2_constraints")
+    selected = await _get_latest_artifact(run_id, token, "phase2_selected_approach")
+    sources = await _get_latest_artifact(run_id, token, "phase2_sources_pack")
+    evidence = await _get_latest_artifact(run_id, token, "phase2_evidence_plan")
+
+    if not accepted:
+        return JSONResponse(status_code=400, content={"detail": "No accepted_topic artifact found"})
+    if not outline:
+        return JSONResponse(status_code=400, content={"detail": "No outline artifact found"})
+    if not constraints:
+        return JSONResponse(status_code=400, content={"detail": "No phase2_constraints artifact found"})
+    if not selected:
+        return JSONResponse(status_code=400, content={"detail": "No phase2_selected_approach artifact found"})
+
+    # Parse optional feedback
+    feedback = None
+    try:
+        body = await request.json()
+        feedback = body.get("feedback")
+    except Exception:
+        pass
+
+    from agents.phase2_methodology import run_methodology_writer
+
+    asyncio.create_task(run_methodology_writer(
+        run_id=run_id,
+        token=token,
+        accepted_topic=accepted["content"],
+        outline=outline["content"],
+        constraints=constraints["content"],
+        selected_approach=selected["content"],
+        sources_pack=sources["content"] if sources else {},
+        evidence_plan=evidence["content"] if evidence else {},
+        feedback=feedback,
+    ))
+
+    return {"status": "running", "step": "phase2_plan"}
 
 
 # ── Legacy SSE test ───────────────────────────────────────────
